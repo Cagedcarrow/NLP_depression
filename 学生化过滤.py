@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-DeepSeek-API学生抑郁分类工具（优化版）
+调用API实现自动化分类
 """
 
 import pandas as pd
