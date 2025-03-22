@@ -1,17 +1,32 @@
+# -*- coding: utf-8 -*-
+"""
+批量翻译工具 - 带自动保存功能
+功能：自动翻译指定Excel列，每100条保存一次进度
+作者：DeepSeek
+"""
+
 import pandas as pd
 import requests
 import hashlib
-import time
 import random
+import time
+import os
 import warnings
 from tqdm import tqdm
+from functools import wraps
 
-# ========== 用户配置区域 ==========
+# ========== 用户配置 ==========
 INPUT_FILE = r"D:\统计建模\初步处理后的包含抑郁字样的数据\数字数据\文字类推断_excel\情绪分析.xlsx"
 OUTPUT_FILE = r"D:\统计建模\初步处理后的包含抑郁字样的数据\数字数据\文字类推断_excel\情绪分析_翻译结果.xlsx"
-COLUMN_NAME = 'Comment'
-MAX_TEXT_LENGTH = 5000  # 百度API单次最大支持6000字节
-# ================================
+BACKUP_FILE = r"D:\统计建模\temp\translation_backup.xlsx"  # 进度备份文件
+COLUMN_NAME = 'Comment'  # 需要翻译的列名
+SAVE_INTERVAL = 100  # 每处理100条保存一次
+MAX_RETRIES = 5  # 最大重试次数
+REQUEST_INTERVAL = 2  # 请求间隔（秒）
+# ============================
+
+# 禁用SSL警告
+warnings.filterwarnings("ignore", category=requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
 def get_api_credentials():
     """安全获取API凭证"""
@@ -28,92 +43,117 @@ def get_api_credentials():
 
     return app_id, secret_key
 
-def generate_sign(appid, query, salt, secret_key):
-    """生成加密签名"""
-    sign_str = appid + query + str(salt) + secret_key
-    return hashlib.md5(sign_str.encode()).hexdigest()
+def retry_request(func):
+    """请求重试装饰器"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        retries = 0
+        while retries < MAX_RETRIES:
+            try:
+                return func(*args, **kwargs)
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as e:
+                wait_time = 2 ** retries  # 指数退避
+                print(f"网络错误: {str(e)}，{wait_time}秒后重试...")
+                time.sleep(wait_time)
+                retries += 1
+        print("超过最大重试次数，跳过本条")
+        return None
+    return wrapper
 
+@retry_request
 def translate_text(text, appid, secret_key):
-    """执行单次翻译（添加SSL错误处理）"""
+    """执行单次翻译"""
     try:
-        # 新增SSL验证设置
-        session = requests.Session()
-        session.verify = False  # 临时关闭SSL验证
-        warnings.filterwarnings("ignore", category=requests.packages.urllib3.exceptions.InsecureRequestWarning)
-
-        # 参数验证
-        if len(text.encode('utf-8')) > MAX_TEXT_LENGTH:
-            print(f"文本过长: {len(text)}字节 (最大支持{MAX_TEXT_LENGTH}字节)")
-            return text
-
-        # 动态生成salt
         salt = random.randint(100000, 999999)
-        sign = generate_sign(appid, text, salt, secret_key)
+        sign = hashlib.md5(
+            (appid + text + str(salt) + secret_key).encode()
+        ).hexdigest()
 
-        params = {
-            'q': text,
-            'from': 'en',
-            'to': 'zh',
-            'appid': appid,
-            'salt': salt,
-            'sign': sign
-        }
+        with requests.Session() as session:
+            session.verify = False  # 禁用SSL验证
+            response = session.get(
+                'https://fanyi-api.baidu.com/api/trans/vip/translate',
+                params={
+                    'q': text[:5000],  # 限制文本长度
+                    'from': 'en',
+                    'to': 'zh',
+                    'appid': appid,
+                    'salt': salt,
+                    'sign': sign
+                },
+                timeout=50
+            )
 
-        response = session.get('https://fanyi-api.baidu.com/api/trans/vip/translate',
-                             params=params,
-                             timeout=10)  # 添加超时设置
         result = response.json()
-
-        # 错误处理
         if 'error_code' in result:
-            error_map = {
-                52003: '认证失败，请检查APP ID/密钥',
-                54001: '请求超限，请检查账户余额',
-                54003: '访问频率过高，请降低请求速度',
-                58000: 'IP地址未绑定'
-            }
-            msg = error_map.get(result['error_code'], f"未知错误: {result}")
-            print(f"API错误: {msg}")
-            return text
-
+            print(f"API错误 [{result['error_code']}]: {result['error_msg']}")
+            return None
         return result['trans_result'][0]['dst']
 
-    except requests.exceptions.SSLError:
-        print("SSL连接异常，尝试使用备用方案...")
-        return translate_text(text, appid, secret_key)  # 自动重试
     except Exception as e:
-        print(f"翻译失败: {str(e)}")
-        return text
+        print(f"翻译异常: {str(e)}")
+        raise
 
-def process_excel(appid, secret_key):
-    df = pd.read_excel(INPUT_FILE, engine='openpyxl')
+def process_with_autosave(appid, secret_key):
+    """带自动保存的处理流程"""
+    # 初始化数据
+    if os.path.exists(BACKUP_FILE):
+        df = pd.read_excel(BACKUP_FILE, engine='openpyxl')
+        processed = df[df[COLUMN_NAME].notna()].index[-1] + 1
+        print(f"检测到备份文件，从第{processed}条继续...")
+    else:
+        df = pd.read_excel(INPUT_FILE, engine='openpyxl')
+        df[COLUMN_NAME] = df[COLUMN_NAME].astype(str)
+        processed = 0
 
-    if COLUMN_NAME not in df.columns:
-        raise ValueError(f"列'{COLUMN_NAME}'不存在")
+    total = len(df)
+    progress_bar = tqdm(total=total, initial=processed, desc="翻译进度")
 
-    # 添加进度说明
-    print(f"\n开始处理 {len(df)} 条数据，预计需要 {len(df)*1.5//60} 分钟...")
+    try:
+        for index in range(processed, total):
+            original_text = df.at[index, COLUMN_NAME]
 
-    for index in tqdm(df.index, desc='翻译进度'):
-        original_text = str(df.at[index, COLUMN_NAME])[:MAX_TEXT_LENGTH//4]  # 安全截断
+            # 跳过空文本和已翻译文本
+            if pd.isna(original_text) or original_text.startswith(("【翻译成功】", "【翻译失败】")):
+                progress_bar.update(1)
+                continue
 
-        if not original_text.strip():
-            continue
+            # 执行翻译
+            try:
+                translated = translate_text(original_text, appid, secret_key)
+                if translated:
+                    df.at[index, COLUMN_NAME] = f"【翻译成功】{translated}"
+                else:
+                    df.at[index, COLUMN_NAME] = f"【翻译失败】{original_text}"
+            except:
+                df.at[index, COLUMN_NAME] = f"【翻译失败】{original_text}"
 
-        translated = translate_text(original_text, appid, secret_key)
-        df.at[index, COLUMN_NAME] = translated
+            # 定期保存
+            if (index + 1) % SAVE_INTERVAL == 0:
+                df.to_excel(BACKUP_FILE, index=False, engine='openpyxl')
+                df.to_excel(OUTPUT_FILE, index=False, engine='openpyxl')
+                print(f"\n已保存 {index+1}/{total} 条进度")
 
-        # 速率控制
-        time.sleep(1.5)  # 免费版QPS=1
+            progress_bar.update(1)
+            time.sleep(REQUEST_INTERVAL + random.uniform(0, 1))  # 随机间隔
 
-    df.to_excel(OUTPUT_FILE, index=False, engine='openpyxl')
+    finally:
+        # 最终保存
+        df.to_excel(OUTPUT_FILE, index=False, engine='openpyxl')
+        if os.path.exists(BACKUP_FILE):
+            os.remove(BACKUP_FILE)
+        progress_bar.close()
 
 if __name__ == '__main__':
     app_id, secret_key = get_api_credentials()
+    os.makedirs(os.path.dirname(BACKUP_FILE), exist_ok=True)
+
     try:
-        process_excel(app_id, secret_key)
-        print(f"\n处理完成！结果已保存至: {OUTPUT_FILE}")
+        process_with_autosave(app_id, secret_key)
+        print("\n处理完成！结果已保存至:", OUTPUT_FILE)
     except Exception as e:
-        print(f"\n致命错误: {str(e)}")
+        print("\n程序异常终止:", str(e))
+        print("最新进度已备份在:", BACKUP_FILE)
     finally:
-        input("按任意键退出...")
+        input("按回车键退出...")
